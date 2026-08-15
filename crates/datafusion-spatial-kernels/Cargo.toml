@@ -1,0 +1,53 @@
+[package]
+name = "datafusion-spatial-kernels"
+description = "Array-in, array-out spatial kernels for datafusion-spatial. No query engine dependency."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-schema = { workspace = true }
+geoarrow-array = { workspace = true }
+geoarrow-schema = { workspace = true }
+geo = { workspace = true }
+geo-traits = { workspace = true }
+proj = { workspace = true, optional = true }
+geohash = { workspace = true }
+geojson = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+wkb = { workspace = true }
+wkt = { workspace = true }
+
+[features]
+default = []
+# Reprojection through PROJ. Off by default: it pulls in a C++ library.
+proj = ["dep:proj", "geo/use-proj"]
+# Build PROJ from source instead of linking the system one.
+proj-bundled = ["proj", "dep:proj", "proj/bundled_proj"]
+
+[dev-dependencies]
+wkt = { workspace = true }
+criterion = "0.5"
+# Counts heap allocations so the "no allocation per row" claims are asserted, not assumed.
+dhat = "0.3"
+
+[[bench]]
+name = "accessors"
+harness = false
+
+[[bench]]
+name = "predicates"
+harness = false
+
+[[bench]]
+name = "caching"
+harness = false
+
+[[bench]]
+name = "aggregates"
+harness = false

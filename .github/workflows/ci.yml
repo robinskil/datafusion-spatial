@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # A weekly run catches a new DataFusion or geoarrow release that breaks the matrix.
+  schedule:
+    - cron: "0 6 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # the version matrix
+  # One job per supported DataFusion major. Add a row here when you add a `dfNN` feature.
+  test:
+    name: test (${{ matrix.datafusion }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - datafusion: df53
+            features: datafusion-spatial/df53,datafusion-spatial/sql
+          - datafusion: df54
+            features: datafusion-spatial/df54,datafusion-spatial/sql
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.datafusion }}
+      - name: Build
+        run: cargo build --workspace --no-default-features --features ${{ matrix.features }}
+      - name: Test
+        run: cargo test --workspace --no-default-features --features ${{ matrix.features }}
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --no-default-features --features ${{ matrix.features }}
+
+  # the arrow invariant
+  # The matrix works only while DataFusion and geoarrow agree on one arrow version. Two arrow
+  # versions in the tree compile, then fail at the type level or behave wrongly. Catch it here.
+  arrow-agreement:
+    name: one arrow version
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - datafusion: df53
+            features: df53,sql
+          - datafusion: df54
+            features: df54,sql
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check that no arrow crate appears twice
+        run: |
+          duplicates=$(cargo tree -p datafusion-spatial -e normal --duplicates \
+            --no-default-features --features ${{ matrix.features }} \
+            | grep -E '^(arrow|geoarrow)' | sort -u || true)
+          if [ -n "$duplicates" ]; then
+            echo "::error::${{ matrix.datafusion }} pulls more than one version of an arrow crate."
+            echo "$duplicates"
+            exit 1
+          fi
+          echo "${{ matrix.datafusion }}: one arrow version, as required."
+
+  # the feature guards
+  # Exactly one version feature must be selected. Both of these builds must fail, with a message
+  # that tells the user what to do.
+  feature-guards:
+    name: version feature guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: No version selected must fail
+        run: |
+          if cargo build -p datafusion-spatial --no-default-features 2>err.txt; then
+            echo "::error::a build with no DataFusion version feature must fail"; exit 1
+          fi
+          grep -q "needs one DataFusion version feature" err.txt \
+            || { echo "::error::wrong message"; cat err.txt; exit 1; }
+      - name: Two versions selected must fail
+        run: |
+          if cargo build -p datafusion-spatial --features df53,df54 2>err.txt; then
+            echo "::error::a build with two DataFusion version features must fail"; exit 1
+          fi
+          grep -q "not two" err.txt || { echo "::error::wrong message"; cat err.txt; exit 1; }
+
+  # formatting and documentation
+  lint:
+    name: fmt and docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - name: Documentation builds with no warnings
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # the optional PROJ feature
+  proj:
+    name: proj feature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install PROJ
+        run: sudo apt-get update && sudo apt-get install -y libproj-dev proj-bin clang
+      - run: cargo test --workspace --features proj
+      - name: The reprojection module must actually run
+        run: |
+          found=$(cargo test --features proj --test spatial -- --list | grep -c 'reprojection::' || true)
+          if [ "$found" -eq 0 ]; then
+            echo "::error::the proj feature is on but no reprojection test was compiled"; exit 1
+          fi
+          echo "reprojection tests compiled: $found"
+
+  # the minimum toolchain
+  msrv:
+    name: minimum rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read rust-version from the workspace
+        id: msrv
+        run: echo "version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets

@@ -1,0 +1,46 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/robinkooyman/datafusion-spatial"
+
+[workspace.dependencies]
+datafusion-spatial = { version = "0.1.0", path = "crates/datafusion-spatial" }
+datafusion-spatial-kernels = { version = "0.1.0", path = "crates/datafusion-spatial-kernels" }
+# No default features: the facade picks the DataFusion version feature explicitly.
+datafusion-spatial-udf = { version = "0.1.0", path = "crates/datafusion-spatial-udf", default-features = false }
+
+# One entry per supported DataFusion major. A crate picks exactly one with a feature.
+# Both of these resolve to arrow 58, which is what geoarrow 0.8 needs. Read the crate README
+# before you add a row: a new major must agree with geoarrow on the arrow version.
+datafusion-53 = { package = "datafusion", version = "53", default-features = false }
+datafusion-54 = { package = "datafusion", version = "54", default-features = false }
+arrow-array = "58"
+arrow-buffer = "58"
+arrow-cast = "58"
+arrow-schema = { version = "58", features = ["canonical_extension_types"] }
+
+geoarrow-array = "0.8"
+geoarrow-schema = "0.8"
+geo = "0.33"
+proj = { version = "0.31", default-features = false, features = ["geo-types"] }
+geo-traits = "0.3"
+wkb = "0.9"
+wkt = "0.14"
+geohash = "0.13"
+geojson = { version = "1", features = ["geo-types"] }
+serde_json = "1"
+
+thiserror = "2"
+
+[profile.release]
+# Keep symbols so `cargo flamegraph` resolves frames instead of hex addresses.
+debug = true
+
+[profile.bench]
+debug = true

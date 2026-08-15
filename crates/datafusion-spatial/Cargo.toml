@@ -1,0 +1,44 @@
+[package]
+name = "datafusion-spatial"
+description = "PostGIS-compatible spatial functions for Apache DataFusion, on GeoArrow."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["df53", "sql"]
+# Exactly one DataFusion major. See the crate documentation.
+df53 = ["dep:datafusion-53", "datafusion-spatial-udf/df53"]
+df54 = ["dep:datafusion-54", "datafusion-spatial-udf/df54"]
+# The SQL parser. The library needs none of it. `SessionContext::sql` does, and so do the tests.
+sql = ["datafusion-53?/sql", "datafusion-54?/sql"]
+# Reprojection through PROJ, linking the system library. Needs PROJ installed.
+proj = ["datafusion-spatial-udf/proj", "datafusion-spatial-kernels/proj"]
+# The same, but building PROJ from source. Needs a C++ toolchain, sqlite3 and libtiff.
+proj-bundled = [
+    "proj",
+    "datafusion-spatial-udf/proj-bundled",
+    "datafusion-spatial-kernels/proj-bundled",
+]
+
+[dependencies]
+datafusion-spatial-kernels = { workspace = true }
+datafusion-spatial-udf = { workspace = true }
+datafusion-53 = { workspace = true, optional = true }
+datafusion-54 = { workspace = true, optional = true }
+geoarrow-array = { workspace = true }
+geoarrow-schema = { workspace = true }
+futures = "0.3"
+
+[dev-dependencies]
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+geo = { workspace = true }
+geoarrow-array = { workspace = true }
+geoarrow-schema = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[[example]]
+name = "joinbench"

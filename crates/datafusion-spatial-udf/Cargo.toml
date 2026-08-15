@@ -1,0 +1,29 @@
+[package]
+name = "datafusion-spatial-udf"
+description = "DataFusion UDF wrappers around datafusion-spatial-kernels."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["df53"]
+# Exactly one DataFusion major. See the crate documentation.
+df53 = ["dep:datafusion-53"]
+df54 = ["dep:datafusion-54"]
+proj = ["datafusion-spatial-kernels/proj"]
+proj-bundled = ["proj", "datafusion-spatial-kernels/proj-bundled"]
+
+[dependencies]
+datafusion-spatial-kernels = { workspace = true }
+datafusion-53 = { workspace = true, optional = true }
+datafusion-54 = { workspace = true, optional = true }
+arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-schema = { workspace = true }
+geoarrow-array = { workspace = true }
+geoarrow-schema = { workspace = true }
+geo = { workspace = true }
+geo-traits = { workspace = true }
