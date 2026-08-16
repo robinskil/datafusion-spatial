@@ -5,7 +5,6 @@
 //! ```bash
 //! cargo test -p datafusion-spatial --features proj
 //! ```
-use crate::common::*;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float64Type, Int32Type};
 use arrow_array::RecordBatch;
