@@ -22,6 +22,38 @@
 //!
 //! The left side is a pre-built `Vec<geo::Point>` in every loop. The point side is not the
 //! variable under test. A fixed left side keeps the right side the only difference.
+//!
+//! # A repeat check over the row box
+//!
+//! `row_repeats/*` prices the check that `st_predicate_scalar` ships. A point column often
+//! repeats a coordinate on neighbouring rows, and such a row can reuse the answer of the row
+//! before it.
+//!
+//! The check sits in front of the geometry build, so a repeat skips that as well as the exact
+//! test. It needs no key of its own either: the scalar loop has already read the box of the row,
+//! and for a point that box is the coordinate. Two comparisons settle it.
+//!
+//! `no_repeats` and `repeats` are the same loop and differ only in those comparisons. `kernel` is
+//! the shipped call, which carries the check and also builds the output array. Over 8192 rows
+//! against a 5000 vertex ring, in microseconds:
+//!
+//! | Ring | Pattern | Distinct | `no_repeats` | `repeats` | Change |
+//! |---|---|--:|--:|--:|--:|
+//! | 5000v | blocked | 1 | 140.9 | 10.8 | -92% |
+//! | 5000v | blocked | 64 | 156.9 | 14.9 | -90% |
+//! | 5000v | blocked | 8192 | 364.1 | 362.4 | -0.5% |
+//! | 5000v | cyclic | 4 | 143.2 | 147.2 | +2.7% |
+//! | 5000v | cyclic | 8192 | 356.1 | 362.2 | +1.7% |
+//! | 16v | blocked | 1 | 202.9 | 11.5 | -94% |
+//! | 16v | blocked | 64 | 213.9 | 14.7 | -93% |
+//! | 16v | blocked | 8192 | 336.0 | 357.9 | +6.5% |
+//! | 16v | cyclic | 8192 | 347.2 | 329.5 | -5.1% |
+//!
+//! A run of repeats runs twelve to sixteen times faster, and the small ring gains more than the
+//! large one because it has no index to fall back on. A column of distinct points shows no
+//! consistent cost. The two 8192 rows at 16 vertices disagree on the sign, and a pair of hundred
+//! sample runs at 5000 vertices gave minus one and plus two per cent. The `no_repeats` baseline
+//! itself moves by three per cent between runs, so any cost here sits inside the noise.
 
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -30,13 +62,19 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use geo::Intersects;
 use geo_traits::to_geo::ToGeoPolygon;
 use geo_traits::{CoordTrait, LineStringTrait, PolygonTrait};
-use geoarrow_array::array::{CoordBuffer, PolygonArray};
-use geoarrow_array::builder::PolygonBuilder;
+use geoarrow_array::array::{CoordBuffer, PointArray, PolygonArray};
+use geoarrow_array::builder::{PointBuilder, PolygonBuilder};
 use geoarrow_array::GeoArrowArrayAccessor;
-use geoarrow_schema::{CoordType, Dimension, PolygonType};
+use geoarrow_schema::{CoordType, Dimension, PointType, PolygonType};
+
+use datafusion_spatial_kernels::bbox::{fill_bboxes, Bbox};
+use datafusion_spatial_kernels::materialize::GeometryReader;
+use datafusion_spatial_kernels::predicate::{
+    st_predicate_scalar, Predicate, PredicateScratch, PreparedLiteral, Side,
+};
 
 mod common;
-use common::{Lcg, BATCH};
+use common::{regular_polygon, Lcg, BATCH};
 
 /// FNV-1a over 64 bit words. Fast, and it needs no dependency.
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -392,6 +430,165 @@ criterion_group!(
     benches,
     bench_small_blocked,
     bench_small_cyclic,
-    bench_large_blocked
+    bench_large_blocked,
+    bench_row_repeats
 );
 criterion_main!(benches);
+
+// ---------------------------------------------------------------------------------------------
+// A repeat check over the row box
+// ---------------------------------------------------------------------------------------------
+
+/// `BATCH` points drawn from `distinct` positions inside the ring.
+fn point_column(distinct: usize, blocked: bool) -> PointArray {
+    let mut rng = Lcg::new(0xB0BA);
+    let pool: Vec<geo::Point<f64>> = (0..distinct)
+        .map(|_| geo::point! { x: (rng.next_f64() - 0.5) * 2.0, y: (rng.next_f64() - 0.5) * 2.0 })
+        .collect();
+    let rows: Vec<geo::Point<f64>> = assignment(distinct, blocked)
+        .iter()
+        .map(|&slot| pool[slot])
+        .collect();
+    PointBuilder::from_points(
+        rows.iter(),
+        PointType::new(Dimension::XY, Default::default()).with_coord_type(CoordType::Separated),
+    )
+    .finish()
+}
+
+/// The scalar loop without the repeat check. This is the kernel before the change.
+fn rows_without_repeats(
+    array: &PointArray,
+    literal: &PreparedLiteral,
+    boxes: &mut Vec<Bbox>,
+) -> usize {
+    fill_bboxes(array, boxes).unwrap();
+    let mut reader = GeometryReader::new(array).unwrap();
+    let literal_bbox = literal.bbox();
+    let mut hits = 0usize;
+    for (index, row_bbox) in boxes.iter().enumerate() {
+        let answer = match Predicate::Within.bbox_verdict(row_bbox, &literal_bbox) {
+            Some(verdict) => verdict,
+            None => match reader.read(index).unwrap() {
+                Some(geom) => literal.evaluate(Predicate::Within, geom, Side::Right),
+                None => false,
+            },
+        };
+        if answer {
+            hits += 1;
+        }
+    }
+    hits
+}
+
+/// The same loop with the repeat check. The only difference is the two comparisons.
+fn rows_with_repeats(
+    array: &PointArray,
+    literal: &PreparedLiteral,
+    boxes: &mut Vec<Bbox>,
+) -> usize {
+    fill_bboxes(array, boxes).unwrap();
+    let mut reader = GeometryReader::new(array).unwrap();
+    let literal_bbox = literal.bbox();
+    let mut last_x = f64::NAN;
+    let mut last_y = f64::NAN;
+    let mut last_answer = false;
+    let mut hits = 0usize;
+    for (index, row_bbox) in boxes.iter().enumerate() {
+        let answer = match Predicate::Within.bbox_verdict(row_bbox, &literal_bbox) {
+            Some(verdict) => verdict,
+            None if row_bbox.minx == last_x && row_bbox.miny == last_y => last_answer,
+            None => {
+                let answer = match reader.read(index).unwrap() {
+                    Some(geom) => literal.evaluate(Predicate::Within, geom, Side::Right),
+                    None => false,
+                };
+                last_x = row_bbox.minx;
+                last_y = row_bbox.miny;
+                last_answer = answer;
+                answer
+            }
+        };
+        if answer {
+            hits += 1;
+        }
+    }
+    hits
+}
+
+/// Does a repeat check over the row box pay for a point column?
+///
+/// The check sits before the geometry build, not inside the predicate, so a repeat skips both.
+/// `no_repeats` and `repeats` are the same loop and differ only in the check. `kernel` is the
+/// shipped call, which carries the check and also builds the output array.
+fn bench_row_repeats(c: &mut Criterion) {
+    // Two sizes. 5000 vertices sits far above the index threshold, so the exact test dominates
+    // the row. 16 sits below it, so the row is mostly the read and the build, and the repeat
+    // check has less to skip.
+    for (vertices, blocked) in [(5000usize, true), (5000, false), (16, true), (16, false)] {
+        let ring = regular_polygon(vertices, 1.0);
+        let label = if blocked { "blocked" } else { "cyclic" };
+        let mut group = c.benchmark_group(format!("row_repeats/{vertices}v/{label}"));
+        group.throughput(criterion::Throughput::Elements(BATCH as u64));
+        group.sample_size(50);
+        group.warm_up_time(std::time::Duration::from_secs(1));
+        group.measurement_time(std::time::Duration::from_secs(3));
+
+        for distinct in [1usize, 4, 64, BATCH] {
+            let array = point_column(distinct, blocked);
+            let literal = PreparedLiteral::new(ring.clone());
+            let mut boxes = Vec::new();
+            let mut scratch = PredicateScratch::new();
+
+            let expected = rows_without_repeats(&array, &literal, &mut boxes);
+            assert_eq!(
+                rows_with_repeats(&array, &literal, &mut boxes),
+                expected,
+                "the repeat check changed an answer"
+            );
+            assert_eq!(
+                st_predicate_scalar(
+                    &array,
+                    &literal,
+                    Predicate::Within,
+                    Side::Right,
+                    &mut scratch,
+                )
+                .unwrap()
+                .values()
+                .count_set_bits(),
+                expected,
+                "the kernel disagrees with the hand rolled loop"
+            );
+
+            let id = |name: &str| BenchmarkId::new(name, distinct);
+            group.bench_function(id("no_repeats"), |b| {
+                b.iter(|| {
+                    black_box(rows_without_repeats(
+                        black_box(&array),
+                        &literal,
+                        &mut boxes,
+                    ))
+                })
+            });
+            group.bench_function(id("repeats"), |b| {
+                b.iter(|| black_box(rows_with_repeats(black_box(&array), &literal, &mut boxes)))
+            });
+            group.bench_function(id("kernel"), |b| {
+                b.iter(|| {
+                    black_box(
+                        st_predicate_scalar(
+                            black_box(&array),
+                            &literal,
+                            Predicate::Within,
+                            Side::Right,
+                            &mut scratch,
+                        )
+                        .unwrap(),
+                    )
+                })
+            });
+        }
+        group.finish();
+    }
+}
