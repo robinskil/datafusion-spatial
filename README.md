@@ -294,11 +294,11 @@ Choose one of two ways to link PROJ:
 
 ```toml
 # Link the PROJ on the machine. This build is fast. It needs PROJ and pkg-config.
-datafusion-spatial = { version = "0.1", features = ["proj"] }
+datafusion-spatial = { version = "0.2", features = ["proj"] }
 
 # Build PROJ from source and link it as a static library.
 # This build needs a C++ toolchain, CMake, sqlite3 and libtiff.
-datafusion-spatial = { version = "0.1", features = ["proj-bundled"] }
+datafusion-spatial = { version = "0.2", features = ["proj-bundled"] }
 ```
 
 ### A limit of the bundled build
@@ -333,13 +333,13 @@ The crate supports more than one DataFusion major. Pick one with a feature.
 Take the default:
 
 ```toml
-datafusion-spatial = "0.1"
+datafusion-spatial = "0.2"
 ```
 
 Take DataFusion 54 instead:
 
 ```toml
-datafusion-spatial = { version = "0.1", default-features = false, features = ["df54", "sql"] }
+datafusion-spatial = { version = "0.2", default-features = false, features = ["df54", "sql"] }
 ```
 
 Turn off the default before you name another version. Two version features at once is a build

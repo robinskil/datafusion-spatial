@@ -3,17 +3,17 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/robinkooyman/datafusion-spatial"
 
 [workspace.dependencies]
-datafusion-spatial = { version = "0.1.0", path = "crates/datafusion-spatial" }
-datafusion-spatial-kernels = { version = "0.1.0", path = "crates/datafusion-spatial-kernels" }
+datafusion-spatial = { version = "0.2.0", path = "crates/datafusion-spatial" }
+datafusion-spatial-kernels = { version = "0.2.0", path = "crates/datafusion-spatial-kernels" }
 # No default features: the facade picks the DataFusion version feature explicitly.
-datafusion-spatial-udf = { version = "0.1.0", path = "crates/datafusion-spatial-udf", default-features = false }
+datafusion-spatial-udf = { version = "0.2.0", path = "crates/datafusion-spatial-udf", default-features = false }
 
 # One entry per supported DataFusion major. A crate picks exactly one with a feature.
 # Both of these resolve to arrow 58, which is what geoarrow 0.8 needs. Read the crate README
