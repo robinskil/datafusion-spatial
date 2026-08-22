@@ -83,13 +83,13 @@ Call each function by its PostGIS name. Each table gives the signature that this
 
 | PostGIS | datafusion-spatial | | Notes |
 |---|---|:--:|---|
-| `ST_Intersects(a, b)` | `ST_Intersects(a, b)` | ✅ | The box test runs first. The direct algorithm answers the rest. |
-| `ST_Disjoint(a, b)` | `ST_Disjoint(a, b)` | ✅ | Two separate boxes prove this predicate true. |
-| `ST_Contains(a, b)` | `ST_Contains(a, b)` | ✅ | The box of `b` must sit inside the box of `a`. |
-| `ST_ContainsProperly(a, b)` | `ST_ContainsProperly(a, b)` | ✅ | |
-| `ST_Within(a, b)` | `ST_Within(a, b)` | ✅ | |
-| `ST_Covers(a, b)` | `ST_Covers(a, b)` | ✅ | |
-| `ST_CoveredBy(a, b)` | `ST_CoveredBy(a, b)` | ✅ | |
+| `ST_Intersects(a, b)` | `ST_Intersects(a, b)` | ✅ | The box test runs first. A point against a constant polygon takes the edge index. |
+| `ST_Disjoint(a, b)` | `ST_Disjoint(a, b)` | ✅ | Two separate boxes prove this predicate true. Otherwise as `ST_Intersects`. |
+| `ST_Contains(a, b)` | `ST_Contains(a, b)` | ✅ | The box of `b` must sit inside the box of `a`. A point against a constant polygon takes the edge index. |
+| `ST_ContainsProperly(a, b)` | `ST_ContainsProperly(a, b)` | ✅ | Same as `ST_Contains` for a point argument. |
+| `ST_Within(a, b)` | `ST_Within(a, b)` | ✅ | The converse of `ST_Contains`, and it takes the same edge index. |
+| `ST_Covers(a, b)` | `ST_Covers(a, b)` | ✅ | The boundary counts. A point against a constant polygon takes the edge index. |
+| `ST_CoveredBy(a, b)` | `ST_CoveredBy(a, b)` | ✅ | The converse of `ST_Covers`, and it takes the same edge index. |
 | `ST_Touches(a, b)` | `ST_Touches(a, b)` | ✅ | Uses the DE-9IM matrix. A constant argument gets the cached R-tree. |
 | `ST_Crosses(a, b)` | `ST_Crosses(a, b)` | ✅ | |
 | `ST_Overlaps(a, b)` | `ST_Overlaps(a, b)` | ✅ | |
@@ -421,6 +421,28 @@ boxes prove `ST_Disjoint`. The measured gain is 8.6 times for `ST_Intersects` an
 **The correct algorithm, not the clever one.** `geo` offers a direct trait and a DE-9IM matrix for
 most predicates. The direct trait wins by about 7 times. So `ST_Contains` and its relatives use it.
 The crate builds the R-tree cache only for the four predicates that need the matrix.
+
+**An edge index for a point against a polygon.** A direct trait still reads every edge of the ring
+for every row. PostGIS indexes the ring edges by their y interval and reads only the edges that
+cross the row. Every direct predicate takes that path against a constant polygon of 16 coordinates
+or more: `ST_Intersects`, `ST_Disjoint`, `ST_Contains`, `ST_ContainsProperly`, `ST_Within`,
+`ST_Covers` and `ST_CoveredBy`. One indexed verdict answers all seven. The two paths cross at
+about 13 vertices, which is where that threshold comes from.
+
+Over 8192 probes against a 5000 vertex ring, one batch drops from 19.5 ms to 360 microseconds.
+`ST_Covers` and `ST_CoveredBy` gain far more, from 7.1 seconds to 360 microseconds, because `geo`
+answers that pair of `Geometry` values from the DE-9IM matrix and no direct algorithm existed.
+
+The index follows the `geo` rule for rings, so no answer changes.
+
+**A repeated point row costs nothing.** A point column often repeats a coordinate on neighbouring
+rows. A denormalized table that carries the location of a store on every event row looks like
+that. For a point the bounding box is the coordinate, and the loop has already read the box. So
+two comparisons settle whether the row repeats the one before it, and a repeat reuses that answer.
+It skips the geometry build as well as the exact test. A column of one repeated point runs twelve
+times faster. A column of distinct points pays between minus one and plus two per cent, which is
+inside the noise of the benchmark. A cache behind the exact test instead of in front of the build
+does not pay; `benches/caching.rs` prices both.
 
 **The extension metadata is a correctness requirement.** Every geometry function implements
 `return_field_from_args`, not `return_type`. A plain `DataType` cannot hold the GeoArrow extension

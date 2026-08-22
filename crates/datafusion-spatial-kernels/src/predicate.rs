@@ -37,6 +37,52 @@
 //! the predicates that genuinely need the matrix: `ST_Touches`, `ST_Crosses`, `ST_Overlaps`,
 //! `ST_Equals` and `ST_Relate`. For those, the cache is worth 32 times its cost.
 //!
+//! # Why a point against a polygon takes a third path
+//!
+//! A direct trait still reads every edge of the ring for every row. A 5000 vertex coastline costs
+//! 20 times a 256 vertex ring. The winding number rule reads an edge only when the y interval of
+//! that edge holds the y of the point, so an index over that interval drops the rest before the
+//! loop starts.
+//!
+//! PostGIS takes the same short circuit in `liblwgeom/intervaltree.c`, under the same two
+//! conditions: the outer geometry is polygonal and the inner geometry is a point.
+//! [`PreparedLiteral`] builds [`PointInPolygonIndex`] on the first such row and reuses it for the
+//! batch. One verdict answers every direct predicate, through [`Predicate::point_rule`].
+//!
+//! Measured over 8192 point probes against a 5000 vertex ring:
+//!
+//! | Predicate | Before | After |
+//! |---|--:|--:|
+//! | `ST_Within` | 19.2 ms | 364 us |
+//! | `ST_Contains` | 19.5 ms | 360 us |
+//! | `ST_Intersects` | 19.6 ms | 359 us |
+//! | `ST_Disjoint` | 19.5 ms | 359 us |
+//! | `ST_Covers` | 7.08 s | 360 us |
+//! | `ST_CoveredBy` | 7.09 s | 362 us |
+//!
+//! `ST_Covers` starts four orders of magnitude behind the rest, and the reason is worth knowing.
+//! `geo` has no direct algorithm for [`Covers`] between two [`Geometry`] values. It answers that
+//! pair from the DE-9IM matrix. [`Predicate::needs_relate`] reports false for `ST_Covers`, so the
+//! literal never builds the R-tree either. The pair therefore ran the full graph, unindexed, once
+//! per row. The verdict removes that whole path for a point probe. It does not remove it for a
+//! column of polygons, which is still open.
+//!
+//! # Why a repeated point row costs nothing
+//!
+//! A point column often repeats a coordinate on neighbouring rows. A denormalized table that
+//! carries the location of a store or a sensor on every event row looks exactly like that.
+//!
+//! For a point the bounding box is the coordinate, and [`st_predicate_scalar`] has already read
+//! the box before it builds anything. So two comparisons settle whether this row repeats the one
+//! before it, and a repeat reuses that answer. It skips the geometry build as well as the exact
+//! test, which is the larger half of the row.
+//!
+//! Over 8192 rows against a 5000 vertex ring, a column of one repeated point runs twelve times
+//! faster. A column of distinct points pays between minus one and plus two per cent, which is
+//! inside the run to run noise of the benchmark itself.
+//!
+//! `benches/caching.rs` prices the check as `row_repeats/*`.
+//!
 //! # Why the prepared geometry lives on the stack
 //!
 //! [`geo::PreparedGeometry`] holds its R-tree behind an [`Rc`][std::rc::Rc], so it is neither
@@ -49,6 +95,7 @@ use std::cell::OnceCell;
 use arrow_array::builder::StringBuilder;
 use arrow_array::{BooleanArray, StringArray};
 use arrow_buffer::{BooleanBufferBuilder, NullBuffer};
+use geo::coordinate_position::CoordPos;
 use geo::relate::IntersectionMatrix;
 use geo::{
     Contains, ContainsProperly, CoordsIter, Covers, Distance, Euclidean, Geometry, Intersects,
@@ -57,8 +104,10 @@ use geo::{
 use geo_traits::to_geo::ToGeoGeometry;
 use geoarrow_array::{downcast_geoarrow_array, GeoArrowArray, GeoArrowArrayAccessor};
 use geoarrow_schema::error::{GeoArrowError, GeoArrowResult};
+use geoarrow_schema::GeoArrowType;
 
 use crate::bbox::{bbox_of, fill_bboxes, Bbox};
+use crate::index::PointInPolygonIndex;
 use crate::materialize::{empty_geometry, geometry_filler, GeometryFiller, GeometryReader};
 
 /// Reusable buffers for a predicate over two arrays.
@@ -111,6 +160,33 @@ pub enum Predicate {
     Overlaps,
     /// `ST_Equals`.
     Equals,
+}
+
+/// How an indexed point-in-polygon verdict answers one predicate.
+///
+/// The index reports one of three positions for a point against a polygonal constant. Each direct
+/// predicate reads that one verdict, so no row walks the rings. See
+/// [`Predicate::point_rule`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PointRule {
+    /// True inside only. `ST_Contains`, `ST_ContainsProperly` and `ST_Within`.
+    Inside,
+    /// True inside and on the boundary. `ST_Intersects`, `ST_Covers` and `ST_CoveredBy`.
+    NotOutside,
+    /// True outside only. `ST_Disjoint`.
+    Outside,
+}
+
+impl PointRule {
+    /// Read one verdict.
+    #[inline]
+    pub fn read(self, position: CoordPos) -> bool {
+        match self {
+            Self::Inside => position == CoordPos::Inside,
+            Self::NotOutside => position != CoordPos::Outside,
+            Self::Outside => position == CoordPos::Outside,
+        }
+    }
 }
 
 impl Predicate {
@@ -171,6 +247,33 @@ impl Predicate {
             self,
             Self::Touches | Self::Crosses | Self::Overlaps | Self::Equals
         )
+    }
+
+    /// How a point-in-polygon verdict answers this predicate, when the areal argument is the
+    /// constant one.
+    ///
+    /// `areal_side` is the side the polygonal constant sits on. `None` means the index cannot
+    /// answer: the constant is on the wrong side of a one-way predicate, or the predicate needs
+    /// the DE-9IM matrix.
+    ///
+    /// PostGIS reads its own interval tree through the same table. A point has no interior of its
+    /// own, so `ST_Contains` and `ST_Within` reduce to one question, and so do `ST_Covers`,
+    /// `ST_CoveredBy` and `ST_Intersects`.
+    pub const fn point_rule(self, areal_side: Side) -> Option<PointRule> {
+        match (self, areal_side) {
+            // The constant holds the point. Only the interior counts.
+            (Self::Contains | Self::ContainsProperly, Side::Left) => Some(PointRule::Inside),
+            (Self::Within, Side::Right) => Some(PointRule::Inside),
+            // The boundary counts as well.
+            (Self::Covers, Side::Left) => Some(PointRule::NotOutside),
+            (Self::CoveredBy, Side::Right) => Some(PointRule::NotOutside),
+            // Symmetric, so the constant may sit on either side.
+            (Self::Intersects, _) => Some(PointRule::NotOutside),
+            (Self::Disjoint, _) => Some(PointRule::Outside),
+            // Either the constant is the inner argument, which no index of the constant can
+            // answer, or the predicate needs the matrix.
+            _ => None,
+        }
     }
 
     /// True when a swap of the two arguments cannot change the answer.
@@ -258,6 +361,9 @@ pub struct PreparedLiteral {
     coord_count: usize,
     /// Built on demand. `None` inside means the geometry is too small to be worth an R-tree.
     prepared: OnceCell<Option<Box<PreparedGeometry<'static, Geometry<f64>>>>>,
+    /// Built on demand for a point probe. `None` inside means the literal is not polygonal, or is
+    /// too small to be worth an edge index.
+    point_index: OnceCell<Option<Box<PointInPolygonIndex>>>,
 }
 
 impl std::fmt::Debug for PreparedLiteral {
@@ -266,6 +372,7 @@ impl std::fmt::Debug for PreparedLiteral {
             .field("geometry", &self.geometry)
             .field("bbox", &self.bbox)
             .field("indexed", &self.prepared.get().is_some())
+            .field("point_indexed", &self.has_point_index())
             .finish()
     }
 }
@@ -275,6 +382,32 @@ impl PreparedLiteral {
     ///
     /// Confirm this number with `cargo bench --bench predicates` before you change it.
     pub const PREPARE_THRESHOLD: usize = 32;
+
+    /// Coordinate count at which the point-in-polygon index starts to pay for itself.
+    ///
+    /// Below this the walk over every edge is already cheap, and the index build is loss.
+    /// Measured over 8192 distinct point probes, with the build inside the timed loop:
+    ///
+    /// | Ring | Coordinates | `geo::Contains` | Indexed | Change |
+    /// |---|--:|--:|--:|--:|
+    /// | 8 vertices | 9 | 255 us | 312 us | +22% |
+    /// | 12 vertices | 13 | 294 us | 309 us | +5% |
+    /// | 14 vertices | 15 | 309 us | 300 us | -3% |
+    /// | 16 vertices | 17 | 324 us | 306 us | -5% |
+    /// | 24 vertices | 25 | 370 us | 310 us | -16% |
+    /// | 64 vertices | 65 | 528 us | 306 us | -42% |
+    /// | 5000 vertices | 5001 | 19.6 ms | 379 us | -98% |
+    ///
+    /// About 300 us of each figure reads the rows, which no predicate avoids. The indexed column
+    /// is nearly flat, because the probe no longer grows with the ring.
+    ///
+    /// The two paths cross between 12 and 14 vertices. This constant counts coordinates, and a
+    /// closed ring of `n` vertices holds `n + 1` of them, so 16 sits just above the crossing.
+    /// Confirm the number with `cargo bench --bench predicates` before you change it.
+    ///
+    /// The figures above use `ST_Contains`. See the module documentation for the other
+    /// predicates, and for why `ST_Covers` starts four orders of magnitude further back.
+    pub const POINT_INDEX_THRESHOLD: usize = 16;
 
     /// Hold a literal geometry for repeated tests.
     ///
@@ -287,6 +420,7 @@ impl PreparedLiteral {
             bbox,
             coord_count,
             prepared: OnceCell::new(),
+            point_index: OnceCell::new(),
         }
     }
 
@@ -338,6 +472,16 @@ impl PreparedLiteral {
             debug_assert!(predicate.is_symmetric());
             return predicate.read_matrix(&self.relate(other));
         }
+        // A point against a polygonal constant is the shape PostGIS short circuits. One indexed
+        // verdict answers every direct predicate, so the row reads the edges that cross its own y
+        // and never walks a ring.
+        if let Geometry::Point(point) = other {
+            if let Some(rule) = predicate.point_rule(literal_side) {
+                if let Some(index) = self.point_index() {
+                    return rule.read(index.locate(point.0));
+                }
+            }
+        }
         match literal_side {
             Side::Left => predicate.evaluate(&self.geometry, other),
             Side::Right => predicate.evaluate(other, &self.geometry),
@@ -347,6 +491,25 @@ impl PreparedLiteral {
     /// Returns true once the R-tree exists. Test hook.
     pub fn is_indexed(&self) -> bool {
         matches!(self.prepared.get(), Some(Some(_)))
+    }
+
+    /// Returns true once the point-in-polygon index exists. Test hook.
+    pub fn has_point_index(&self) -> bool {
+        matches!(self.point_index.get(), Some(Some(_)))
+    }
+
+    /// The edge index over the literal, built on the first point probe.
+    ///
+    /// `None` when the literal is not polygonal, or holds too few vertices to repay the build.
+    fn point_index(&self) -> Option<&PointInPolygonIndex> {
+        self.point_index
+            .get_or_init(|| {
+                if self.coord_count < Self::POINT_INDEX_THRESHOLD {
+                    return None;
+                }
+                PointInPolygonIndex::new(&self.geometry).map(Box::new)
+            })
+            .as_deref()
     }
 
     fn index(&self) -> Option<&PreparedGeometry<'static, Geometry<f64>>> {
@@ -427,6 +590,23 @@ pub fn st_predicate_scalar(
     // One geometry for the whole batch. Each row that survives the box test refills it in place.
     let mut row = empty_geometry();
 
+    // A point column often repeats a coordinate on neighbouring rows. A denormalized table that
+    // carries the location of a store or a sensor on every event row looks exactly like that.
+    //
+    // For a point the bounding box is the coordinate, and the loop has already read the box. So
+    // an equal box means an equal row, and the answer of the row before it still stands. Such a
+    // row then skips the geometry build as well as the exact test.
+    //
+    // Two conditions gate this. Only a point column qualifies, because two different geometries
+    // can share a box. And the literal must hold a box of its own: against a literal with a box,
+    // every verdict above settles a row whose own box is empty, so no null row and no empty point
+    // reaches the test below. That keeps the empty case out of the loop.
+    let repeats = matches!(array.data_type(), GeoArrowType::Point(_)) && !literal_bbox.is_empty();
+    // NaN equals nothing, so the first row of a batch can never match.
+    let mut last_x = f64::NAN;
+    let mut last_y = f64::NAN;
+    let mut last_answer = false;
+
     let mut values = BooleanBufferBuilder::new(len);
     for index in 0..len {
         let row_bbox = scratch.left[index];
@@ -438,11 +618,27 @@ pub fn st_predicate_scalar(
             values.append(answer);
             continue;
         }
-        if filler(index, &mut row)? {
-            values.append(literal.evaluate(predicate, &row, literal_side));
-        } else {
-            values.append(false);
+
+        debug_assert!(
+            !repeats || !row_bbox.is_empty(),
+            "a row with an empty box must have been settled by its verdict"
+        );
+        if repeats && row_bbox.minx == last_x && row_bbox.miny == last_y {
+            values.append(last_answer);
+            continue;
         }
+
+        let answer = if filler(index, &mut row)? {
+            literal.evaluate(predicate, &row, literal_side)
+        } else {
+            false
+        };
+        if repeats {
+            last_x = row_bbox.minx;
+            last_y = row_bbox.miny;
+            last_answer = answer;
+        }
+        values.append(answer);
     }
 
     Ok(BooleanArray::new(values.finish(), nulls))
@@ -1031,6 +1227,440 @@ mod tests {
                 flipped,
                 constant_left,
                 "{} disagreed with the constant on the left",
+                predicate.function_name()
+            );
+        }
+    }
+
+    /// A ring, a ring with a hole, and two rings. Each is over the index threshold.
+    fn indexable_literals() -> Vec<Geometry<f64>> {
+        let Geometry::Polygon(shell) = regular_ring(128) else {
+            unreachable!()
+        };
+        let scaled = |factor: f64, dx: f64| {
+            geo::LineString::new(
+                shell
+                    .exterior()
+                    .0
+                    .iter()
+                    .map(|coord| geo::coord! { x: coord.x * factor + dx, y: coord.y * factor })
+                    .collect(),
+            )
+        };
+        vec![
+            Geometry::Polygon(shell.clone()),
+            Geometry::Polygon(geo::Polygon::new(
+                shell.exterior().clone(),
+                vec![scaled(0.4, 0.0)],
+            )),
+            Geometry::MultiPolygon(geo::MultiPolygon::new(vec![
+                geo::Polygon::new(scaled(0.8, -1.4), vec![]),
+                geo::Polygon::new(scaled(0.8, 1.4), vec![]),
+            ])),
+        ]
+    }
+
+    /// Points spread over the shape, plus every vertex and every edge midpoint.
+    ///
+    /// The last two groups sit exactly on the boundary. That is where `ST_Contains` and
+    /// `ST_Covers` part company, so a verdict that reads the boundary wrongly shows up here.
+    fn boundary_and_spread_probes(geometry: &Geometry<f64>) -> Vec<geo::Point<f64>> {
+        let mut state = 0x5EEDu64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        let mut probes: Vec<geo::Point<f64>> = (0..300)
+            .map(|_| geo::point! { x: (next() - 0.5) * 5.2, y: (next() - 0.5) * 2.6 })
+            .collect();
+
+        let rings: Vec<&geo::LineString<f64>> = match geometry {
+            Geometry::Polygon(polygon) => std::iter::once(polygon.exterior())
+                .chain(polygon.interiors())
+                .collect(),
+            Geometry::MultiPolygon(multi) => multi
+                .iter()
+                .flat_map(|polygon| std::iter::once(polygon.exterior()).chain(polygon.interiors()))
+                .collect(),
+            _ => Vec::new(),
+        };
+        for ring in rings {
+            for edge in ring.0.windows(2) {
+                probes.push(geo::point! { x: edge[0].x, y: edge[0].y });
+                probes.push(geo::point! {
+                    x: (edge[0].x + edge[1].x) / 2.0,
+                    y: (edge[0].y + edge[1].y) / 2.0,
+                });
+            }
+        }
+        probes
+    }
+
+    /// The index must never change an answer, for any predicate, on either side.
+    ///
+    /// The reference is [`Predicate::evaluate`], which is the call the unindexed path makes.
+    #[test]
+    fn the_point_index_never_changes_an_answer() {
+        for literal in indexable_literals() {
+            let probes = boundary_and_spread_probes(&literal);
+            let prepared = PreparedLiteral::new(literal.clone());
+
+            for predicate in Predicate::ALL {
+                for side in [Side::Left, Side::Right] {
+                    for probe in &probes {
+                        let row = Geometry::Point(*probe);
+                        let want = match side {
+                            Side::Left => predicate.evaluate(&literal, &row),
+                            Side::Right => predicate.evaluate(&row, &literal),
+                        };
+                        assert_eq!(
+                            prepared.evaluate(predicate, &row, side),
+                            want,
+                            "{} with the constant on the {side:?} disagreed at {probe:?}",
+                            predicate.function_name()
+                        );
+                    }
+                }
+            }
+            assert!(
+                prepared.has_point_index(),
+                "the fixture must reach the indexed path"
+            );
+        }
+    }
+
+    /// The table that decides which predicate reads the verdict. A `None` here is a lost
+    /// speedup, so the pairs that must be indexed are pinned.
+    #[test]
+    fn the_point_rule_table_covers_every_direct_predicate() {
+        use Predicate::*;
+
+        // The constant is the areal side, so it holds the point.
+        for predicate in [Contains, ContainsProperly] {
+            assert_eq!(predicate.point_rule(Side::Left), Some(PointRule::Inside));
+            assert_eq!(predicate.point_rule(Side::Right), None);
+        }
+        assert_eq!(Covers.point_rule(Side::Left), Some(PointRule::NotOutside));
+        assert_eq!(Covers.point_rule(Side::Right), None);
+
+        // The converse pair reads the other way round.
+        assert_eq!(Within.point_rule(Side::Right), Some(PointRule::Inside));
+        assert_eq!(Within.point_rule(Side::Left), None);
+        assert_eq!(
+            CoveredBy.point_rule(Side::Right),
+            Some(PointRule::NotOutside)
+        );
+        assert_eq!(CoveredBy.point_rule(Side::Left), None);
+
+        // Symmetric, so either side works.
+        for side in [Side::Left, Side::Right] {
+            assert_eq!(Intersects.point_rule(side), Some(PointRule::NotOutside));
+            assert_eq!(Disjoint.point_rule(side), Some(PointRule::Outside));
+        }
+
+        // A DE-9IM predicate keeps the R-tree path.
+        for predicate in Predicate::ALL.iter().filter(|p| p.needs_relate()) {
+            for side in [Side::Left, Side::Right] {
+                assert_eq!(
+                    predicate.point_rule(side),
+                    None,
+                    "{} needs the matrix",
+                    predicate.function_name()
+                );
+            }
+        }
+    }
+
+    /// The constant path and the two array path must agree on a polygon over the threshold.
+    ///
+    /// The constant side reads the edge index. The two array side never builds one, so this
+    /// compares the indexed kernel with the unindexed kernel, end to end.
+    #[test]
+    fn scalar_and_array_paths_agree_on_a_large_polygon() {
+        let Geometry::Polygon(ring) = regular_ring(128) else {
+            unreachable!()
+        };
+        let probes = boundary_and_spread_probes(&Geometry::Polygon(ring.clone()));
+        let array = PointBuilder::from_points(
+            probes.iter(),
+            PointType::new(Dimension::XY, Default::default()),
+        )
+        .finish();
+        let polygons = PolygonBuilder::from_polygons(
+            &vec![ring.clone(); probes.len()],
+            PolygonType::new(Dimension::XY, Default::default()),
+        )
+        .finish();
+
+        let literal = PreparedLiteral::new(Geometry::Polygon(ring));
+        let mut scratch = PredicateScratch::new();
+
+        for predicate in Predicate::ALL {
+            let constant_right =
+                st_predicate_scalar(&array, &literal, predicate, Side::Right, &mut scratch)
+                    .unwrap();
+            assert_eq!(
+                st_predicate(&array, &polygons, predicate).unwrap(),
+                constant_right,
+                "{} disagreed with the constant on the right",
+                predicate.function_name()
+            );
+
+            let constant_left =
+                st_predicate_scalar(&array, &literal, predicate, Side::Left, &mut scratch).unwrap();
+            assert_eq!(
+                st_predicate(&polygons, &array, predicate).unwrap(),
+                constant_left,
+                "{} disagreed with the constant on the left",
+                predicate.function_name()
+            );
+        }
+        assert!(literal.has_point_index(), "the index must have been used");
+    }
+
+    /// A hole takes a point back out, and the boundary splits `ST_Contains` from `ST_Covers`.
+    #[test]
+    fn the_index_reads_a_hole_and_a_boundary() {
+        let Geometry::Polygon(shell) = regular_ring(64) else {
+            unreachable!()
+        };
+        let hole = geo::LineString::new(
+            shell
+                .exterior()
+                .0
+                .iter()
+                .map(|coord| geo::coord! { x: coord.x * 0.4, y: coord.y * 0.4 })
+                .collect(),
+        );
+        let on_the_shell = shell.exterior().0[0];
+        let donut = geo::Polygon::new(shell.exterior().clone(), vec![hole]);
+
+        let array = PointBuilder::from_points(
+            [
+                geo::point!(x: 0.0, y: 0.0),                     // in the hole
+                geo::point!(x: 0.7, y: 0.0),                     // in the ring
+                geo::point!(x: 0.95, y: 0.9),                    // outside
+                geo::Point::new(on_the_shell.x, on_the_shell.y), // on the shell
+            ]
+            .iter(),
+            PointType::new(Dimension::XY, Default::default()),
+        )
+        .finish();
+
+        let literal = PreparedLiteral::new(Geometry::Polygon(donut));
+        let mut scratch = PredicateScratch::new();
+        let run = |predicate, side, scratch: &mut PredicateScratch| {
+            st_predicate_scalar(&array, &literal, predicate, side, scratch).unwrap()
+        };
+
+        // The interior only.
+        for (predicate, side) in [
+            (Predicate::Within, Side::Right),
+            (Predicate::Contains, Side::Left),
+        ] {
+            let result = run(predicate, side, &mut scratch);
+            let name = predicate.function_name();
+            assert!(!result.value(0), "{name}: the hole is not inside");
+            assert!(result.value(1), "{name}: the ring is");
+            assert!(!result.value(2), "{name}: the corner is not");
+            assert!(!result.value(3), "{name}: the shell is not inside");
+        }
+
+        // The interior and the boundary.
+        for (predicate, side) in [
+            (Predicate::Covers, Side::Left),
+            (Predicate::CoveredBy, Side::Right),
+            (Predicate::Intersects, Side::Right),
+        ] {
+            let result = run(predicate, side, &mut scratch);
+            let name = predicate.function_name();
+            assert!(!result.value(0), "{name}: the hole is still out");
+            assert!(result.value(1), "{name}: the ring is in");
+            assert!(!result.value(2), "{name}: the corner is out");
+            assert!(result.value(3), "{name}: the shell counts here");
+        }
+
+        // The complement of intersects.
+        let disjoint = run(Predicate::Disjoint, Side::Right, &mut scratch);
+        assert!(disjoint.value(0));
+        assert!(!disjoint.value(1));
+        assert!(disjoint.value(2));
+        assert!(!disjoint.value(3));
+
+        assert!(literal.has_point_index());
+    }
+
+    /// A point column with runs of repeats must answer exactly as one without them.
+    ///
+    /// The scalar path reuses the answer of the row before when the box repeats. The two array
+    /// path has no such reuse, so it is the reference. Nulls sit between the runs, because a null
+    /// row carries an empty box and must never key a repeat.
+    #[test]
+    fn a_repeated_point_row_reuses_the_right_answer() {
+        let Geometry::Polygon(ring) = regular_ring(128) else {
+            unreachable!()
+        };
+
+        // Runs of a point inside, a point outside, a point exactly on a vertex, and nulls.
+        let vertex = ring.exterior().0[0];
+        let sources = [
+            Some(geo::point! { x: 0.2, y: 0.1 }),
+            Some(geo::point! { x: 0.2, y: 0.1 }),
+            Some(geo::point! { x: 0.2, y: 0.1 }),
+            None,
+            None,
+            Some(geo::Point::new(vertex.x, vertex.y)),
+            Some(geo::Point::new(vertex.x, vertex.y)),
+            Some(geo::point! { x: 40.0, y: 40.0 }),
+            Some(geo::point! { x: 40.0, y: 40.0 }),
+            Some(geo::point! { x: -0.3, y: 0.6 }),
+            None,
+            Some(geo::point! { x: -0.3, y: 0.6 }),
+            // A negative zero compares equal to a zero. Both name the same coordinate.
+            Some(geo::point! { x: 0.0, y: 0.5 }),
+            Some(geo::point! { x: -0.0, y: 0.5 }),
+        ];
+        let array = PointBuilder::from_nullable_points(
+            sources.iter().map(|point| point.as_ref()),
+            PointType::new(Dimension::XY, Default::default()),
+        )
+        .finish();
+        let polygons = PolygonBuilder::from_polygons(
+            &vec![ring.clone(); sources.len()],
+            PolygonType::new(Dimension::XY, Default::default()),
+        )
+        .finish();
+
+        let literal = PreparedLiteral::new(Geometry::Polygon(ring));
+        let mut scratch = PredicateScratch::new();
+        for predicate in Predicate::ALL {
+            for side in [Side::Left, Side::Right] {
+                let reused =
+                    st_predicate_scalar(&array, &literal, predicate, side, &mut scratch).unwrap();
+                let reference = match side {
+                    Side::Right => st_predicate(&array, &polygons, predicate).unwrap(),
+                    Side::Left => st_predicate(&polygons, &array, predicate).unwrap(),
+                };
+                assert_eq!(
+                    reused,
+                    reference,
+                    "{} with the constant on the {side:?} reused a wrong answer",
+                    predicate.function_name()
+                );
+            }
+        }
+    }
+
+    /// Only a point column may reuse a row. Two polygons can share a box and still differ.
+    ///
+    /// The square holds the probe. The triangle has the same box and does not. If the reuse ever
+    /// escaped the point column, the second row would copy the answer of the first.
+    #[test]
+    fn a_polygon_row_never_reuses_the_row_before_it() {
+        let square = geo::wkt! { POLYGON((0.0 0.0,1.0 0.0,1.0 1.0,0.0 1.0,0.0 0.0)) };
+        let triangle = geo::wkt! { POLYGON((0.0 0.0,1.0 0.0,0.0 1.0,0.0 0.0)) };
+        assert_eq!(
+            bbox_of(&Geometry::Polygon(square.clone())),
+            bbox_of(&Geometry::Polygon(triangle.clone())),
+            "the fixture needs two shapes with one box"
+        );
+
+        let rows = PolygonBuilder::from_polygons(
+            &[square, triangle],
+            PolygonType::new(Dimension::XY, Default::default()),
+        )
+        .finish();
+
+        // The probe sits inside the square and outside the triangle.
+        let literal = PreparedLiteral::new(Geometry::Point(geo::point! { x: 0.75, y: 0.75 }));
+        let mut scratch = PredicateScratch::new();
+        let contains = st_predicate_scalar(
+            &rows,
+            &literal,
+            Predicate::Contains,
+            Side::Right,
+            &mut scratch,
+        )
+        .unwrap();
+
+        assert!(contains.value(0), "the square holds the probe");
+        assert!(!contains.value(1), "the triangle does not");
+    }
+
+    /// The edge index answers a point against a polygon. Every other call must leave it unbuilt.
+    #[test]
+    fn only_a_point_against_a_polygon_builds_the_edge_index() {
+        let array = points(CoordType::Separated);
+        let mut scratch = PredicateScratch::new();
+
+        let small = PreparedLiteral::new(unit_square());
+        st_predicate_scalar(&array, &small, Predicate::Within, Side::Right, &mut scratch).unwrap();
+        assert!(
+            !small.has_point_index(),
+            "a 5 vertex constant is below the threshold"
+        );
+
+        let line = PreparedLiteral::new(Geometry::LineString(
+            geo::wkt! { LINESTRING(-1.0 -1.0,9.0 9.0) },
+        ));
+        st_predicate_scalar(&array, &line, Predicate::Within, Side::Right, &mut scratch).unwrap();
+        assert!(!line.has_point_index(), "a line has no inside to index");
+
+        let touches = PreparedLiteral::new(regular_ring(64));
+        st_predicate_scalar(
+            &array,
+            &touches,
+            Predicate::Touches,
+            Side::Right,
+            &mut scratch,
+        )
+        .unwrap();
+        assert!(
+            !touches.has_point_index(),
+            "a DE-9IM predicate keeps the R-tree path"
+        );
+        assert!(touches.is_indexed(), "and builds that R-tree instead");
+
+        // A polygon column, not a point column. The index answers a point probe only.
+        let squares = PolygonBuilder::from_polygons(
+            &vec![unit_square_polygon(); 2],
+            PolygonType::new(Dimension::XY, Default::default()),
+        )
+        .finish();
+        let rows = PreparedLiteral::new(regular_ring(64));
+        st_predicate_scalar(
+            &squares,
+            &rows,
+            Predicate::Within,
+            Side::Right,
+            &mut scratch,
+        )
+        .unwrap();
+        assert!(
+            !rows.has_point_index(),
+            "a polygon row is not a point probe"
+        );
+
+        // Each direct predicate, with the constant on the side that holds the point.
+        for (predicate, side) in [
+            (Predicate::Within, Side::Right),
+            (Predicate::CoveredBy, Side::Right),
+            (Predicate::Contains, Side::Left),
+            (Predicate::ContainsProperly, Side::Left),
+            (Predicate::Covers, Side::Left),
+            (Predicate::Intersects, Side::Right),
+            (Predicate::Disjoint, Side::Right),
+        ] {
+            let literal = PreparedLiteral::new(regular_ring(64));
+            st_predicate_scalar(&array, &literal, predicate, side, &mut scratch).unwrap();
+            assert!(
+                literal.has_point_index(),
+                "{} must reach the edge index",
+                predicate.function_name()
+            );
+            assert!(
+                !literal.is_indexed(),
+                "{} must not also build the R-tree",
                 predicate.function_name()
             );
         }

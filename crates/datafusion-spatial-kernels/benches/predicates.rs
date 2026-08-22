@@ -1,11 +1,13 @@
 //! `ST_Intersects` throughput.
 //!
-//! Four questions this benchmark answers:
+//! Five questions this benchmark answers:
 //!
 //! 1. What does the bounding box prefilter buy? `prefilter/on` against `prefilter/off`.
 //! 2. What does the R-tree buy, and on which algorithm? The four `literal/*` cases.
 //! 3. What does WKB input cost? `encoding/native` against `encoding/wkb`.
 //! 4. What does a column argument cost against a constant? `shape/*`.
+//! 5. What does the edge index buy a direct predicate against a polygon constant, and above
+//!    which ring size? The `point_in_polygon/*` cases.
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use datafusion_spatial_kernels::materialize::GeometryReader;
@@ -229,7 +231,9 @@ criterion_group!(
     bench_literal,
     bench_encoding,
     bench_shape,
-    bench_verdicts
+    bench_verdicts,
+    bench_point_in_polygon,
+    bench_point_in_polygon_gain
 );
 criterion_main!(benches);
 
@@ -286,6 +290,149 @@ fn bench_verdicts(c: &mut Criterion) {
                 }
             }
             black_box(hits)
+        })
+    });
+
+    group.finish();
+}
+
+/// The before and after, one case per direct predicate, on a 5000 vertex ring.
+///
+/// `unindexed` is the exact call the kernel made before the index existed. `ST_Covers` and
+/// `ST_CoveredBy` reach `geo` as two `Geometry` values, and `geo` answers that pair from the
+/// DE-9IM matrix, not from the direct trait. So those two start seconds behind the rest.
+///
+/// The sample count is low on purpose. One unindexed `ST_Covers` batch takes about seven seconds,
+/// so a full sample set would run for a quarter of an hour.
+fn bench_point_in_polygon_gain(c: &mut Criterion) {
+    use criterion::BenchmarkId;
+    use datafusion_spatial_kernels::predicate::{st_predicate_scalar, Predicate, Side};
+
+    let mut group = c.benchmark_group("ST_Predicate/point_in_polygon_gain");
+    group.throughput(criterion::Throughput::Elements(BATCH as u64));
+    group.sample_size(10);
+    group.warm_up_time(std::time::Duration::from_millis(500));
+    group.measurement_time(std::time::Duration::from_secs(2));
+
+    let array = points(BATCH, 2.0, CoordType::Separated);
+    let mut scratch = PredicateScratch::new();
+
+    // Each direct predicate, with the constant on the side that holds the point.
+    let shapes = [
+        (Predicate::Within, Side::Right),
+        (Predicate::CoveredBy, Side::Right),
+        (Predicate::Contains, Side::Left),
+        (Predicate::Covers, Side::Left),
+        (Predicate::Intersects, Side::Right),
+        (Predicate::Disjoint, Side::Right),
+    ];
+    let ring = regular_polygon(5000, 1.0);
+    for (predicate, side) in shapes {
+        // The call the kernel made before the index existed.
+        group.bench_function(BenchmarkId::new("unindexed", predicate.sql_name()), |b| {
+            b.iter(|| {
+                let mut reader = GeometryReader::new(&array).unwrap();
+                let mut hits = 0usize;
+                for index in 0..array.len() {
+                    if let Some(geom) = reader.read(index).unwrap() {
+                        let answer = match side {
+                            Side::Left => predicate.evaluate(&ring, geom),
+                            Side::Right => predicate.evaluate(geom, &ring),
+                        };
+                        if answer {
+                            hits += 1;
+                        }
+                    }
+                }
+                black_box(hits)
+            })
+        });
+
+        let literal = PreparedLiteral::new(regular_polygon(5000, 1.0));
+        group.bench_function(BenchmarkId::new("indexed", predicate.sql_name()), |b| {
+            b.iter(|| {
+                black_box(
+                    st_predicate_scalar(black_box(&array), &literal, predicate, side, &mut scratch)
+                        .unwrap(),
+                )
+            })
+        });
+    }
+
+    group.finish();
+}
+
+/// What the edge index buys a direct predicate on a point column against a polygon constant.
+///
+/// `direct` and `indexed` sweep the ring size to set the threshold. `direct` is `geo::Contains`,
+/// which walks every edge for every row. `indexed` builds [`PointInPolygonIndex`] once and reads
+/// only the edges that cross the y of the row. The build sits inside the timed loop, because the
+/// kernel builds one per batch.
+///
+/// `ST_Predicate/point_in_polygon_gain` then prices each predicate, before against after.
+fn bench_point_in_polygon(c: &mut Criterion) {
+    use criterion::BenchmarkId;
+    use datafusion_spatial_kernels::index::PointInPolygonIndex;
+    use datafusion_spatial_kernels::predicate::{st_predicate_scalar, Predicate, Side};
+    use geo::Contains;
+
+    let mut group = c.benchmark_group("ST_Predicate/point_in_polygon");
+    group.throughput(criterion::Throughput::Elements(BATCH as u64));
+
+    // Points packed inside the ring, so the box test settles no row and every row runs the exact
+    // test. That is the case the index is for.
+    let array = points(BATCH, 2.0, CoordType::Separated);
+    let mut scratch = PredicateScratch::new();
+
+    for vertices in [5usize, 8, 10, 12, 14, 16, 24, 32, 64, 256, 1000, 5000] {
+        let ring = regular_polygon(vertices, 1.0);
+
+        group.bench_with_input(BenchmarkId::new("direct", vertices), &ring, |b, ring| {
+            b.iter(|| {
+                let mut reader = GeometryReader::new(&array).unwrap();
+                let mut hits = 0usize;
+                for index in 0..array.len() {
+                    if let Some(geom) = reader.read(index).unwrap() {
+                        if ring.contains(geom) {
+                            hits += 1;
+                        }
+                    }
+                }
+                black_box(hits)
+            })
+        });
+
+        group.bench_with_input(BenchmarkId::new("indexed", vertices), &ring, |b, ring| {
+            b.iter(|| {
+                let edges = PointInPolygonIndex::new(ring).unwrap();
+                let mut reader = GeometryReader::new(&array).unwrap();
+                let mut hits = 0usize;
+                for index in 0..array.len() {
+                    if let Some(geo::Geometry::Point(point)) = reader.read(index).unwrap() {
+                        if edges.contains(point.0) {
+                            hits += 1;
+                        }
+                    }
+                }
+                black_box(hits)
+            })
+        });
+    }
+
+    // The control: 9 coordinates sits below the threshold, so this ring keeps the plain path.
+    let small = PreparedLiteral::new(regular_polygon(8, 1.0));
+    group.bench_function("kernel_8v/st_within", |b| {
+        b.iter(|| {
+            black_box(
+                st_predicate_scalar(
+                    black_box(&array),
+                    &small,
+                    Predicate::Within,
+                    Side::Right,
+                    &mut scratch,
+                )
+                .unwrap(),
+            )
         })
     });
 

@@ -62,6 +62,72 @@ async fn contains_and_within_are_converses() -> datafusion::error::Result<()> {
     Ok(())
 }
 
+/// A large polygon constant sends every direct predicate through the edge index.
+///
+/// The row at `(1, 0)` is exactly the first vertex of the ring. That row separates the
+/// predicates that count the boundary from the ones that do not.
+#[tokio::test]
+async fn a_large_constant_polygon_answers_every_direct_predicate() -> datafusion::error::Result<()>
+{
+    let ctx = scattered_points()?;
+
+    // A 64 vertex circle of radius 1, centred on the origin. That is over the index threshold.
+    let mut vertices: Vec<String> = (0..64)
+        .map(|i| {
+            let angle = (i as f64) / 64.0 * std::f64::consts::TAU;
+            format!("{} {}", angle.cos(), angle.sin())
+        })
+        .collect();
+    vertices.push(vertices[0].clone());
+    let ring = format!("ST_GeomFromText('POLYGON(({}))')", vertices.join(","));
+
+    // One row on the boundary, one inside, one outside. `ST_Point` over a column keeps the row
+    // side a column, so the constant takes the indexed path.
+    let rows = "(VALUES (1.0, 0.0), (0.5, 0.5), (40.0, 40.0)) AS t(x, y)";
+    let batches = collect(
+        &ctx,
+        &format!(
+            "SELECT ST_Contains({ring}, ST_Point(x, y)) AS contains, \
+                    ST_Within(ST_Point(x, y), {ring}) AS within, \
+                    ST_Covers({ring}, ST_Point(x, y)) AS covers, \
+                    ST_CoveredBy(ST_Point(x, y), {ring}) AS coveredby, \
+                    ST_Intersects(ST_Point(x, y), {ring}) AS intersects, \
+                    ST_Disjoint(ST_Point(x, y), {ring}) AS disjoint \
+             FROM {rows}"
+        ),
+    )
+    .await?;
+
+    let column = |index: usize| batches[0].column(index).as_boolean().clone();
+    let (boundary, inside, outside) = (0usize, 1usize, 2usize);
+
+    // The interior only.
+    for index in [0usize, 1] {
+        let got = column(index);
+        assert!(
+            !got.value(boundary),
+            "column {index}: the vertex is not inside"
+        );
+        assert!(got.value(inside), "column {index}: the middle is");
+        assert!(!got.value(outside), "column {index}: the far row is not");
+    }
+
+    // The interior and the boundary.
+    for index in [2usize, 3, 4] {
+        let got = column(index);
+        assert!(got.value(boundary), "column {index}: the vertex counts");
+        assert!(got.value(inside), "column {index}: so does the middle");
+        assert!(!got.value(outside), "column {index}: the far row does not");
+    }
+
+    // The complement of intersects.
+    let disjoint = column(5);
+    assert!(!disjoint.value(boundary));
+    assert!(!disjoint.value(inside));
+    assert!(disjoint.value(outside));
+    Ok(())
+}
+
 /// `ST_Disjoint` must be the exact complement of `ST_Intersects`.
 #[tokio::test]
 async fn disjoint_complements_intersects() -> datafusion::error::Result<()> {
