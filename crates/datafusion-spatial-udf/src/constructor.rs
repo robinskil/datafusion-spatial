@@ -17,6 +17,7 @@ use datafusion::logical_expr::{
 use datafusion_spatial_kernels::constructor;
 use geoarrow_schema::{Dimension, GeoArrowType};
 
+use crate::signature::{self, Arg};
 use crate::util::{
     all_scalar, as_f64, geo_array, geo_field, geo_type, to_array_of_size, to_df, wrap_geo_result,
 };
@@ -181,7 +182,7 @@ impl StMakePolygon {
     /// Build the UDF.
     pub fn new() -> Self {
         Self {
-            signature: Signature::any(1, Volatility::Immutable),
+            signature: signature::geometries(1),
         }
     }
 }
@@ -244,7 +245,8 @@ impl StMakeLine {
     /// Build the UDF.
     pub fn new() -> Self {
         Self {
-            signature: Signature::any(2, Volatility::Immutable),
+            // Two points, and only points. WKB would not pass the check below.
+            signature: signature::args(&[Arg::Coordinates, Arg::Coordinates]),
         }
     }
 }

@@ -12,13 +12,13 @@ use arrow_schema::{DataType, FieldRef};
 use datafusion::common::{plan_err, Result, ScalarValue};
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
-    Volatility,
 };
 use datafusion_spatial_kernels::component::{
     self, geometry_output_type, line_string_output_type, point_output_type, Index, LineEnd,
 };
 use geoarrow_schema::GeoArrowType;
 
+use crate::signature::{self, Arg};
 use crate::util::{
     all_scalar, as_i32, geo_array, geo_field, geo_type, to_array_of_size, to_df, wrap_geo_result,
 };
@@ -43,7 +43,7 @@ impl LineEndUdf {
             end,
             name,
             postgis_name,
-            signature: Signature::any(1, Volatility::Immutable),
+            signature: signature::geometries(1),
         }
     }
 }
@@ -128,7 +128,7 @@ impl IndexedComponentUdf {
     pub fn new(component: IndexedComponent) -> Self {
         Self {
             component,
-            signature: Signature::any(2, Volatility::Immutable),
+            signature: signature::args(&[Arg::Geometry, Arg::Integer]),
         }
     }
 }
@@ -217,7 +217,7 @@ impl StExteriorRing {
     /// Build the UDF.
     pub fn new() -> Self {
         Self {
-            signature: Signature::any(1, Volatility::Immutable),
+            signature: signature::geometries(1),
         }
     }
 }

@@ -9,13 +9,13 @@ use arrow_schema::{DataType, Field, FieldRef};
 use datafusion::common::{plan_err, Result};
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
-    TypeSignature, Volatility,
 };
 use datafusion_spatial_kernels::linear::{
     self, line_output_type, point_output_type, st_line_interpolate_point,
 };
 use geoarrow_schema::GeoArrowType;
 
+use crate::signature::{self, Arg};
 use crate::util::{
     all_scalar, as_f64, check_same_crs, geo_array, geo_field, geo_type, to_array_of_size, to_df,
     wrap_geo_result, wrap_result,
@@ -33,7 +33,7 @@ impl NearestUdf {
     pub fn new(line: bool) -> Self {
         Self {
             line,
-            signature: Signature::any(2, Volatility::Immutable),
+            signature: signature::geometries(2),
         }
     }
 
@@ -115,7 +115,7 @@ impl StLineLocatePoint {
     /// Build the UDF.
     pub fn new() -> Self {
         Self {
-            signature: Signature::any(2, Volatility::Immutable),
+            signature: signature::geometries(2),
         }
     }
 }
@@ -175,7 +175,7 @@ impl StLineInterpolatePoint {
     /// Build the UDF.
     pub fn new() -> Self {
         Self {
-            signature: Signature::one_of(vec![TypeSignature::Any(2)], Volatility::Immutable),
+            signature: signature::args(&[Arg::Geometry, Arg::Number]),
         }
     }
 }
@@ -247,7 +247,7 @@ impl StProject {
     /// Build the UDF.
     pub fn new() -> Self {
         Self {
-            signature: Signature::any(3, Volatility::Immutable),
+            signature: signature::args(&[Arg::Geometry, Arg::Number, Arg::Number]),
         }
     }
 }

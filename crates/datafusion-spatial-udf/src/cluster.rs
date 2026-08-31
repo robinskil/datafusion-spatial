@@ -22,12 +22,11 @@ use arrow_array::{Array, ArrayRef};
 use arrow_schema::{DataType, Field, FieldRef};
 use datafusion::common::{exec_err, plan_err, Result, ScalarValue};
 use datafusion::logical_expr::function::{PartitionEvaluatorArgs, WindowUDFFieldArgs};
-use datafusion::logical_expr::{
-    PartitionEvaluator, Signature, Volatility, WindowUDF, WindowUDFImpl,
-};
+use datafusion::logical_expr::{PartitionEvaluator, Signature, WindowUDF, WindowUDFImpl};
 use datafusion_spatial_kernels::cluster::{st_cluster_dbscan, st_cluster_kmeans, Cluster};
 use geoarrow_array::array::from_arrow_array;
 
+use crate::signature::{self, Arg};
 use crate::util::{geo_type, to_df};
 
 /// `ST_ClusterKMeans` or `ST_ClusterDBSCAN`.
@@ -42,7 +41,12 @@ impl ClusterUdf {
     pub fn new(cluster: Cluster) -> Self {
         Self {
             cluster,
-            signature: Signature::any(1 + cluster.parameter_count(), Volatility::Immutable),
+            signature: match cluster {
+                // ST_ClusterKMeans(geom, k)
+                Cluster::KMeans => signature::args(&[Arg::Geometry, Arg::Integer]),
+                // ST_ClusterDBSCAN(geom, eps, minpoints)
+                Cluster::Dbscan => signature::args(&[Arg::Geometry, Arg::Number, Arg::Integer]),
+            },
         }
     }
 }

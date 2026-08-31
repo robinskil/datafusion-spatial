@@ -10,7 +10,6 @@ use arrow_schema::{DataType, Field, FieldRef};
 use datafusion::common::{plan_err, Result, ScalarValue};
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
-    TypeSignature, Volatility,
 };
 use datafusion_spatial_kernels::predicate::{
     self, geometry_at, st_dfully_within, st_dwithin, st_predicate_scalar, st_predicate_with,
@@ -18,6 +17,7 @@ use datafusion_spatial_kernels::predicate::{
 };
 use geoarrow_array::GeoArrowArray;
 
+use crate::signature::{self, Arg};
 use crate::util::{all_scalar, check_same_crs, geo_array, geo_type, to_df, wrap_result};
 
 /// Any of the eleven two-argument predicates.
@@ -35,7 +35,7 @@ impl PredicateUdf {
     pub fn new(predicate: Predicate) -> Self {
         Self {
             predicate,
-            signature: Signature::any(2, Volatility::Immutable),
+            signature: signature::geometries(2),
         }
     }
 }
@@ -140,7 +140,7 @@ impl DistancePredicateUdf {
     pub fn new(fully: bool) -> Self {
         Self {
             fully,
-            signature: Signature::any(3, Volatility::Immutable),
+            signature: signature::args(&[Arg::Geometry, Arg::Geometry, Arg::Number]),
         }
     }
 
@@ -227,10 +227,10 @@ impl StRelate {
     /// Build the UDF.
     pub fn new() -> Self {
         Self {
-            signature: Signature::one_of(
-                vec![TypeSignature::Any(2), TypeSignature::Any(3)],
-                Volatility::Immutable,
-            ),
+            signature: signature::one_of(&[
+                &[Arg::Geometry, Arg::Geometry],
+                &[Arg::Geometry, Arg::Geometry, Arg::Text],
+            ]),
         }
     }
 

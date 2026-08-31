@@ -10,7 +10,6 @@ use arrow_schema::{DataType, Field, FieldRef};
 use datafusion::common::{plan_err, Result};
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
-    TypeSignature, Volatility,
 };
 use datafusion_spatial_kernels::affine::{affine, Affine};
 use datafusion_spatial_kernels::process::{
@@ -18,6 +17,7 @@ use datafusion_spatial_kernels::process::{
 };
 use geoarrow_schema::GeoArrowType;
 
+use crate::signature::{self, Arg};
 use crate::util::{
     all_scalar, as_f64, check_same_crs, geo_array, geo_field, geo_type, to_array_of_size, to_df,
     wrap_geo_result, wrap_result,
@@ -35,7 +35,7 @@ impl OverlayUdf {
     pub fn new(operation: Overlay) -> Self {
         Self {
             operation,
-            signature: Signature::any(2, Volatility::Immutable),
+            signature: signature::geometries(2),
         }
     }
 }
@@ -96,7 +96,7 @@ impl ShapeUdf {
     pub fn new(transform: Shape) -> Self {
         Self {
             transform,
-            signature: Signature::any(1, Volatility::Immutable),
+            signature: signature::geometries(1),
         }
     }
 }
@@ -152,7 +152,7 @@ impl SizedShapeUdf {
     pub fn new(transform: Sized) -> Self {
         Self {
             transform,
-            signature: Signature::any(2, Volatility::Immutable),
+            signature: signature::args(&[Arg::Geometry, Arg::Number]),
         }
     }
 }
@@ -219,10 +219,8 @@ impl AffineUdf {
     pub fn new(transform: Affine) -> Self {
         Self {
             transform,
-            signature: Signature::one_of(
-                vec![TypeSignature::Any(1 + transform.parameter_count())],
-                Volatility::Immutable,
-            ),
+            // Every affine parameter is a coordinate, a factor or an angle.
+            signature: signature::geometry_then(Arg::Number, transform.parameter_count()),
         }
     }
 }
@@ -293,7 +291,7 @@ impl StIsValid {
     pub fn new(reason: bool) -> Self {
         Self {
             reason,
-            signature: Signature::any(1, Volatility::Immutable),
+            signature: signature::geometries(1),
         }
     }
 
