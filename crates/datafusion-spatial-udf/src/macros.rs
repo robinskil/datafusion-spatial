@@ -26,10 +26,7 @@ macro_rules! unary_geometry_udf {
                 Self {
                     // A geometry argument. Its Arrow storage type varies by encoding, so the
                     // signature accepts anything and the return field does the real check.
-                    signature: ::datafusion::logical_expr::Signature::any(
-                        1,
-                        ::datafusion::logical_expr::Volatility::Immutable,
-                    ),
+                    signature: $crate::signature::geometries(1),
                 }
             }
         }
@@ -92,11 +89,15 @@ macro_rules! unary_geometry_udf {
 /// `$output_type` maps the input [`GeoArrowType`][geoarrow_schema::GeoArrowType] to the output
 /// one. The map runs at plan time. So the output field holds the right extension metadata
 /// and the coordinate reference system survives the call.
+///
+/// `$arg` is the [`Arg`][crate::signature::Arg] kind of the geometry. It must name a type that
+/// `$output_type` accepts, because the function catalog builds a return type from it.
 #[macro_export]
 macro_rules! unary_transform_udf {
     (
         $(#[$meta:meta])*
-        $struct:ident, $sql_name:literal, $postgis_name:literal, $output_type:expr, $kernel:path
+        $struct:ident, $sql_name:literal, $postgis_name:literal, $output_type:expr, $kernel:path,
+        $arg:expr
     ) => {
         $(#[$meta])*
         #[derive(Debug, PartialEq, Eq, Hash)]
@@ -108,10 +109,7 @@ macro_rules! unary_transform_udf {
             /// Build the UDF.
             pub fn new() -> Self {
                 Self {
-                    signature: ::datafusion::logical_expr::Signature::any(
-                        1,
-                        ::datafusion::logical_expr::Volatility::Immutable,
-                    ),
+                    signature: $crate::signature::args(&[$arg]),
                 }
             }
 

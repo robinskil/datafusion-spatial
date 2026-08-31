@@ -15,9 +15,7 @@ use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field, FieldRef};
 use datafusion::common::{Result, ScalarValue};
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
-use datafusion::logical_expr::{
-    Accumulator, AggregateUDF, AggregateUDFImpl, Signature, Volatility,
-};
+use datafusion::logical_expr::{Accumulator, AggregateUDF, AggregateUDFImpl, Signature};
 use datafusion_spatial_kernels::aggregate::Extent;
 use datafusion_spatial_kernels::aggregate::{Collect, UnionAll};
 use geoarrow_array::array::from_arrow_array;
@@ -26,6 +24,7 @@ use geoarrow_array::builder::RectBuilder;
 use geoarrow_array::GeoArrowArray;
 use geoarrow_schema::{BoxType, Dimension, GeoArrowType};
 
+use crate::signature;
 use crate::util::{geo_type, to_df};
 
 const NAME: &str = "st_extent";
@@ -40,7 +39,7 @@ impl StExtent {
     /// Build the aggregate.
     pub fn new() -> Self {
         Self {
-            signature: Signature::any(1, Volatility::Immutable),
+            signature: signature::geometries(1),
         }
     }
 }
@@ -216,7 +215,7 @@ impl GatherUdf {
         Self {
             gather,
             name,
-            signature: Signature::any(1, Volatility::Immutable),
+            signature: signature::geometries(1),
         }
     }
 

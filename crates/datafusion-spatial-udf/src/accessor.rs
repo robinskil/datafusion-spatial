@@ -9,11 +9,11 @@ use arrow_schema::{DataType, Field, FieldRef};
 use datafusion::common::{plan_err, Result};
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
-    Volatility,
 };
 use datafusion_spatial_kernels::accessor::{accepts_ordinate, ordinate, Ordinate};
 use datafusion_spatial_kernels::{accessor, crs};
 
+use crate::signature;
 use crate::util::{all_scalar, geo_array, geo_type, to_df, wrap_result};
 
 /// `ST_X`, `ST_Y`, `ST_Z` or `ST_M`. One struct serves all four.
@@ -38,7 +38,7 @@ impl OrdinateUdf {
         Self {
             ordinate,
             name,
-            signature: Signature::any(1, Volatility::Immutable),
+            signature: signature::geometries(1),
         }
     }
 }

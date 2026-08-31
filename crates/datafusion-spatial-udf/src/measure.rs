@@ -9,12 +9,12 @@ use arrow_schema::{DataType, Field, FieldRef};
 use datafusion::common::Result;
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
-    Volatility,
 };
 use datafusion_spatial_kernels::measure::{
     binary_measure, unary_measure, BinaryMeasure, UnaryMeasure,
 };
 
+use crate::signature;
 use crate::util::{all_scalar, check_same_crs, geo_array, geo_type, to_df, wrap_result};
 
 /// `ST_Area`, `ST_Length` or `ST_Perimeter`.
@@ -29,7 +29,7 @@ impl UnaryMeasureUdf {
     pub fn new(measure: UnaryMeasure) -> Self {
         Self {
             measure,
-            signature: Signature::any(1, Volatility::Immutable),
+            signature: signature::geometries(1),
         }
     }
 }
@@ -82,7 +82,7 @@ impl BinaryMeasureUdf {
     pub fn new(measure: BinaryMeasure) -> Self {
         Self {
             measure,
-            signature: Signature::any(2, Volatility::Immutable),
+            signature: signature::geometries(2),
         }
     }
 }

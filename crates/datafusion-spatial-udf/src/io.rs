@@ -9,11 +9,12 @@ use arrow_schema::{DataType, Field, FieldRef};
 use datafusion::common::{plan_err, Result};
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
-    TypeSignature, Volatility,
+    Volatility,
 };
 use datafusion_spatial_kernels::io;
 use geoarrow_schema::GeoArrowType;
 
+use crate::signature::{self, Arg};
 use crate::util::{
     all_scalar, as_binary, as_utf8, geo_array, geo_field, geo_type, require_constant_i32, to_array,
     to_df, wrap_geo_result, wrap_result,
@@ -185,10 +186,7 @@ impl StGeoHash {
     /// Build the UDF.
     pub fn new() -> Self {
         Self {
-            signature: Signature::one_of(
-                vec![TypeSignature::Any(1), TypeSignature::Any(2)],
-                Volatility::Immutable,
-            ),
+            signature: signature::one_of(&[&[Arg::Geometry], &[Arg::Geometry, Arg::Integer]]),
         }
     }
 }

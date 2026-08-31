@@ -10,7 +10,6 @@ use arrow_schema::{DataType, FieldRef};
 use datafusion::common::{plan_err, Result};
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
-    TypeSignature, Volatility,
 };
 use datafusion_spatial_kernels::edit::{
     dump_field, st_dump, st_snap_to_grid, structure, vertex_edit, Structure, VertexEdit,
@@ -19,6 +18,7 @@ use datafusion_spatial_kernels::process::output_type;
 use datafusion_spatial_kernels::tessellate::{tessellate, Tessellation};
 use geoarrow_schema::GeoArrowType;
 
+use crate::signature::{self, Arg};
 use crate::util::{
     all_scalar, as_f64, as_i32, geo_array, geo_field, geo_type, to_array_of_size, to_df,
     wrap_geo_result,
@@ -36,7 +36,7 @@ impl StructureUdf {
     pub fn new(edit: Structure) -> Self {
         Self {
             edit,
-            signature: Signature::any(1, Volatility::Immutable),
+            signature: signature::geometries(1),
         }
     }
 }
@@ -92,7 +92,7 @@ impl TessellateUdf {
     pub fn new(kind: Tessellation) -> Self {
         Self {
             kind,
-            signature: Signature::any(1, Volatility::Immutable),
+            signature: signature::geometries(1),
         }
     }
 }
@@ -146,7 +146,7 @@ impl StSnapToGrid {
     /// Build the UDF.
     pub fn new() -> Self {
         Self {
-            signature: Signature::any(2, Volatility::Immutable),
+            signature: signature::args(&[Arg::Geometry, Arg::Number]),
         }
     }
 }
@@ -214,12 +214,12 @@ impl VertexEditUdf {
     pub fn new(edit: VertexEdit) -> Self {
         // ST_AddPoint takes an optional position, the other two require one.
         let signature = match edit {
-            VertexEdit::Add => Signature::one_of(
-                vec![TypeSignature::Any(2), TypeSignature::Any(3)],
-                Volatility::Immutable,
-            ),
-            VertexEdit::Remove => Signature::any(2, Volatility::Immutable),
-            VertexEdit::Set => Signature::any(3, Volatility::Immutable),
+            VertexEdit::Add => signature::one_of(&[
+                &[Arg::Geometry, Arg::Geometry],
+                &[Arg::Geometry, Arg::Geometry, Arg::Integer],
+            ]),
+            VertexEdit::Remove => signature::args(&[Arg::Geometry, Arg::Integer]),
+            VertexEdit::Set => signature::args(&[Arg::Geometry, Arg::Integer, Arg::Geometry]),
         };
         Self { edit, signature }
     }
@@ -336,7 +336,7 @@ impl StDump {
     /// Build the UDF.
     pub fn new() -> Self {
         Self {
-            signature: Signature::any(1, Volatility::Immutable),
+            signature: signature::geometries(1),
         }
     }
 }

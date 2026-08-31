@@ -285,6 +285,26 @@ A list of geometries then arrives as a plain struct. No spatial function accepts
 WKB avoids the problem. A plain `Binary` column is always WKB under the rule below.
 So the parts stay usable without a cast.
 
+## `SHOW FUNCTIONS`
+
+`SHOW FUNCTIONS` lists the functions of this crate. So does `information_schema.parameters`.
+Turn on the information schema first:
+
+```rust
+let config = SessionConfig::new().with_information_schema(true);
+let ctx = SessionContext::new_with_config(config);
+datafusion_spatial::register_all(&ctx);
+```
+
+The view holds one example argument type per function. A geometry argument reads as `Binary`,
+which is WKB. A few functions need a coordinate buffer, so they read as `FixedSizeList`.
+The example type restricts no call. Every function still accepts each GeoArrow encoding.
+
+Two functions stay out of the view: `ST_SetSRID` and `ST_Transform`. Each one stamps the
+coordinate reference system on its output column. The return type therefore follows the value of
+the second argument. DataFusion builds the view with no argument values, so it derives no return
+type and writes no row. Both functions still run.
+
 ## PROJ
 
 `ST_Transform` needs [PROJ](https://proj.org), a C++ library. The feature is off by default.

@@ -83,7 +83,8 @@ async fn one_argument_st_union_is_a_planning_error() -> datafusion::error::Resul
         .await
         .unwrap_err();
     assert!(
-        err.to_string().contains("expected 2 arguments"),
+        err.to_string()
+            .contains("expects 2 arguments but received 1"),
         "unexpected error: {err}"
     );
     Ok(())

@@ -8,12 +8,12 @@ use arrow_schema::{DataType, FieldRef};
 use datafusion::common::{plan_err, Result};
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
-    TypeSignature, Volatility,
 };
 use datafusion_spatial_kernels::{crs, transform};
 use geoarrow_schema::error::GeoArrowResult;
 use geoarrow_schema::{Dimension, GeoArrowType};
 
+use crate::signature::{self, Arg};
 use crate::util::{
     all_scalar, constant_i32, geo_array, geo_field, geo_type, require_constant_i32, to_df,
     wrap_geo_result,
@@ -25,7 +25,8 @@ unary_transform_udf!(
     "st_flipcoordinates",
     "ST_FlipCoordinates",
     (|input| Ok(transform::flipped_type(input))) as fn(&GeoArrowType) -> GeoArrowResult<GeoArrowType>,
-    transform::st_flip_coordinates
+    transform::st_flip_coordinates,
+    Arg::Geometry
 );
 
 unary_transform_udf!(
@@ -35,7 +36,9 @@ unary_transform_udf!(
     "ST_Force2D",
     (|input| transform::forced_type(input, Dimension::XY))
         as fn(&GeoArrowType) -> GeoArrowResult<GeoArrowType>,
-    transform::st_force_2d
+    transform::st_force_2d,
+    // WKB and WKT carry no dimension, so the catalog example must be a native geometry.
+    Arg::Coordinates
 );
 
 unary_transform_udf!(
@@ -45,7 +48,8 @@ unary_transform_udf!(
     "ST_Force3D",
     (|input| transform::forced_type(input, Dimension::XYZ))
         as fn(&GeoArrowType) -> GeoArrowResult<GeoArrowType>,
-    transform::st_force_3d
+    transform::st_force_3d,
+    Arg::Coordinates
 );
 
 /// `ST_SetSRID(geometry, srid)`.
@@ -62,7 +66,7 @@ impl StSetSrid {
     /// Build the UDF.
     pub fn new() -> Self {
         Self {
-            signature: Signature::one_of(vec![TypeSignature::Any(2)], Volatility::Immutable),
+            signature: signature::args(&[Arg::Geometry, Arg::Integer]),
         }
     }
 }

@@ -68,6 +68,7 @@ pub mod process;
 /// `ST_Transform`. Needs the `proj` feature.
 #[cfg(feature = "proj")]
 pub mod reproject;
+pub mod signature;
 pub mod transform;
 pub mod util;
 

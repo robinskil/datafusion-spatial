@@ -16,6 +16,7 @@ mod affine;
 mod aggregates;
 mod bearings;
 mod bounding_box;
+mod catalog;
 mod clusters;
 mod components;
 mod constructors;

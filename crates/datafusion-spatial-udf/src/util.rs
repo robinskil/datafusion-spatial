@@ -141,9 +141,10 @@ pub fn require_constant_i32(
 
 /// Read an argument as `Float64`. Any other number type widens to it.
 ///
-/// A geometry argument forces `Signature::any`, which does no coercion at all, so
-/// `ST_Translate(geom, 10, 20)` arrives with `Int64` constants. This step keeps those
-/// queries valid. It also keeps the plan-time geometry check that `Signature::any` buys.
+/// A geometry argument forces a signature that does no coercion at all (see
+/// [`crate::signature`]), so `ST_Translate(geom, 10, 20)` arrives with `Int64` constants. This
+/// step keeps those queries valid. It also keeps the plan-time geometry check that the signature
+/// buys.
 pub fn as_f64(function: &str, argument: usize, array: &ArrayRef) -> Result<Float64Array> {
     if matches!(array.data_type(), DataType::Float64) {
         return Ok(array
@@ -165,7 +166,7 @@ pub fn as_f64(function: &str, argument: usize, array: &ArrayRef) -> Result<Float
 
 /// Read an argument as `Int32`. Any other integer type narrows to it.
 ///
-/// Like [`as_f64`], this exists because a geometry argument forces `Signature::any`, which does no
+/// Like [`as_f64`], this exists because a geometry argument forces a signature that does no
 /// coercion, so `ST_RemovePoint(line, 1)` arrives with an `Int64` literal.
 pub fn as_i32(function: &str, argument: usize, array: &ArrayRef) -> Result<Int32Array> {
     if matches!(array.data_type(), DataType::Int32) {

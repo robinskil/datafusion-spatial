@@ -10,11 +10,11 @@ use arrow_schema::{DataType, FieldRef};
 use datafusion::common::{plan_err, Result};
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
-    Volatility,
 };
 use datafusion_spatial_kernels::crs::srid_of;
 use datafusion_spatial_kernels::reproject::{output_type, st_transform_with, transformation};
 
+use crate::signature::{self, Arg};
 use crate::util::{
     all_scalar, constant_i32, geo_array, geo_field, geo_type, require_constant_i32, to_df,
     wrap_geo_result,
@@ -33,7 +33,7 @@ impl StTransform {
     /// Build the UDF.
     pub fn new() -> Self {
         Self {
-            signature: Signature::any(2, Volatility::Immutable),
+            signature: signature::args(&[Arg::Geometry, Arg::Integer]),
         }
     }
 }
